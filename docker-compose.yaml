@@ -11,7 +11,7 @@ services:
     # Add "dns" if you have a problem with resolving "web.whatsapp.com"
 
     ports:
-      - '3001:3001'
+      - '3001:3000'
     logging:
       driver: 'json-file'
       options:
