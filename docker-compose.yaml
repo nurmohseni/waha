@@ -1,4 +1,3 @@
-# https://waha.devlike.pro/docs/how-to/install/
 services:
   waha:
     restart: always
@@ -9,31 +8,35 @@ services:
         max-size: '100m'
         max-file: '10'
 
-    # REMOVED the 'ports' section. Dokploy will manage this.
+    # --- REMOVED 'ports' ---
+    # Dokploy will manage this based on your UI settings.
 
     volumes:
-      # REMOVED the conflicting './sessions' volume.
-      # We are using Postgres instead.
+      # --- REMOVED './sessions' ---
+      # This conflicts with the Postgres database.
 
-      # Save media files (This one is fine to keep)
+      # This one is for media, which is fine, but
+      # we are using Postgres for media now (see .env),
+      # so you can safely remove it too.
       - './media:/app/.media'
 
     env_file:
-      - .env
+      - .env # This now points to your file from Step 1
 
-    # This is important! It waits for Postgres to be ready.
+    # This is crucial: It waits for Postgres to be ready
+    # before starting WAHA.
     depends_on:
       - postgres
 
   postgres:
-    image: postgres:17.6 # The documentation uses postgres:17, 17.6 is fine.
+    image: postgres:17.6
     restart: always
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
     ports:
-      # This port is fine, it's only for your local server access.
+      # This is fine, it doesn't interfere with Dokploy
       - '127.0.0.1:5432:5432'
     volumes:
       - pg_data:/var/lib/postgresql/data
@@ -48,6 +51,8 @@ services:
         max-file: '10'
 
 volumes:
+  # These are not used, but fine to leave
   mongodb_data: {}
   minio_data: {}
+  # This is used by your postgres service
   pg_data: {}
