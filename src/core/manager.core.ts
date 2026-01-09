@@ -218,11 +218,20 @@ export class SessionManagerCore extends SessionManager implements OnModuleInit {
     webhook.configure(session, webhooks);
 
     // Apps
-    await this.appsService.beforeSessionStart(session, this.store);
+    try {
+      await this.appsService.beforeSessionStart(session, this.store);
+    } catch (e) {
+      logger.error(`Apps Error: ${e}`);
+      session.status = WAHASessionStatus.FAILED;
+    }
 
     // start session
-    await session.start();
-    logger.info('Session has been started.');
+    if (session.status !== WAHASessionStatus.FAILED) {
+      await session.start();
+      logger.info('Session has been started.');
+      // Apps
+      await this.appsService.afterSessionStart(session, this.store);
+    }
 
     // Apps
     await this.appsService.afterSessionStart(session, this.store);
@@ -295,6 +304,7 @@ export class SessionManagerCore extends SessionManager implements OnModuleInit {
 
   async delete(name: string): Promise<void> {
     this.onlyDefault(name);
+    await this.appsService.removeBySession(this, name);
     this.session = DefaultSessionStatus.REMOVED;
     this.updateSession();
     this.sessionConfig = undefined;
@@ -349,6 +359,10 @@ export class SessionManagerCore extends SessionManager implements OnModuleInit {
           status: WAHASessionStatus.STOPPED,
           config: this.sessionConfig,
           me: null,
+          presence: null,
+          timestamps: {
+            activity: null,
+          },
         },
       ];
     }
@@ -367,6 +381,10 @@ export class SessionManagerCore extends SessionManager implements OnModuleInit {
         status: session.status,
         config: session.sessionConfig,
         me: me,
+        presence: session.presence,
+        timestamps: {
+          activity: session?.getLastActivityTimestamp(),
+        },
       },
     ];
   }
@@ -400,7 +418,10 @@ export class SessionManagerCore extends SessionManager implements OnModuleInit {
     }
     const session = sessions[0];
     const engine = await this.fetchEngineInfo();
-    return { ...session, engine: engine };
+    return {
+      ...session,
+      engine: engine,
+    };
   }
 
   protected stopEvents() {

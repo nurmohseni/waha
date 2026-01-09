@@ -1,3 +1,4 @@
+tmp/*
 Dockerfile
 docker-compose
 src/core/engines/gows/proto
@@ -10,6 +11,8 @@ docs
 examples
 .github
 .git
+.envs/*
+.env
 
 # compiled output
 /dist

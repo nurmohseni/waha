@@ -44,6 +44,10 @@ import {
   WANumberExistResult,
 } from '../structures/chatting.dto';
 import { WAMessage } from '../structures/responses.dto';
+import {
+  mentionsAll,
+  validateRequestMentions,
+} from '@waha/core/utils/mentions.all';
 
 @ApiSecurity('api_key')
 @Controller('api')
@@ -55,6 +59,10 @@ export class ChattingController {
   @ApiOperation({ summary: 'Send a text message' })
   async sendText(@Body() request: MessageTextRequest): Promise<WAMessage> {
     const whatsapp = await this.manager.getWorkingSession(request.session);
+    if (mentionsAll(request)) {
+      validateRequestMentions(request);
+      request.mentions = await whatsapp.resolveMentionsAll(request.chatId);
+    }
     return whatsapp.sendText(request);
   }
 
@@ -66,6 +74,10 @@ export class ChattingController {
   })
   async sendImage(@Body() request: MessageImageRequest) {
     const whatsapp = await this.manager.getWorkingSession(request.session);
+    if (mentionsAll(request)) {
+      validateRequestMentions(request);
+      request.mentions = await whatsapp.resolveMentionsAll(request.chatId);
+    }
     return whatsapp.sendImage(request);
   }
 
@@ -77,6 +89,10 @@ export class ChattingController {
   })
   async sendFile(@Body() request: MessageFileRequest) {
     const whatsapp = await this.manager.getWorkingSession(request.session);
+    if (mentionsAll(request)) {
+      validateRequestMentions(request);
+      request.mentions = await whatsapp.resolveMentionsAll(request.chatId);
+    }
     return whatsapp.sendFile(request);
   }
 
@@ -99,6 +115,10 @@ export class ChattingController {
   })
   async sendVideo(@Body() request: MessageVideoRequest) {
     const whatsapp = await this.manager.getWorkingSession(request.session);
+    if (mentionsAll(request)) {
+      validateRequestMentions(request);
+      request.mentions = await whatsapp.resolveMentionsAll(request.chatId);
+    }
     return whatsapp.sendVideo(request);
   }
 

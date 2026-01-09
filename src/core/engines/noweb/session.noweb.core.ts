@@ -1,5 +1,5 @@
+import { Browsers, WABrowserDescription } from '@adiwajshing/baileys';
 import makeWASocket, {
-  Browsers,
   Chat,
   Contact,
   decryptPollVote,
@@ -10,7 +10,6 @@ import makeWASocket, {
   getAggregateVotesInPollMessage,
   getContentType,
   getKeyAuthor,
-  isJidGroup,
   isPnUser,
   isRealMessage,
   jidNormalizedUser,
@@ -24,7 +23,6 @@ import makeWASocket, {
   WAMessageKey,
   WAMessageUpdate,
 } from '@adiwajshing/baileys';
-import type { WABrowserDescription } from '@adiwajshing/baileys';
 import { WACallEvent } from '@adiwajshing/baileys/lib/Types/Call';
 import { BaileysEventMap } from '@adiwajshing/baileys/lib/Types/Events';
 import { GroupMetadata } from '@adiwajshing/baileys/lib/Types/GroupMetadata';
@@ -38,18 +36,15 @@ import {
 } from '@adiwajshing/baileys/lib/Types/LabelAssociation';
 import { MessageUserReceiptUpdate } from '@adiwajshing/baileys/lib/Types/Message';
 import { ILogger } from '@adiwajshing/baileys/lib/Utils/logger';
-import {
-  isJidBroadcast,
-  isLidUser,
-} from '@adiwajshing/baileys/lib/WABinary/jid-utils';
+import { isLidUser } from '@adiwajshing/baileys/lib/WABinary/jid-utils';
 import { UnprocessableEntityException } from '@nestjs/common';
 import {
-  ensureSuffix,
   getChannelInviteLink,
   getPublicUrlFromDirectPath,
   WhatsappSession,
 } from '@waha/core/abc/session.abc';
 import {
+  ToGroupParticipant,
   ToGroupV2JoinEvent,
   ToGroupV2LeaveEvent,
   ToGroupV2Participants,
@@ -72,6 +67,7 @@ import type { Agent } from 'https';
 import { IMediaEngineProcessor } from '@waha/core/media/IMediaEngineProcessor';
 import { QR } from '@waha/core/QR';
 import { AckToStatus, StatusToAck } from '@waha/core/utils/acks';
+import { pairs } from '@waha/utils/pairs';
 import { ExtractMessageKeysForRead } from '@waha/core/utils/convertors';
 import { parseMessageIdSerialized } from '@waha/core/utils/ids';
 import { isJidNewsletter, toCusFormat, toJID } from '@waha/core/utils/jids';
@@ -140,6 +136,7 @@ import {
 import { BinaryFile, RemoteFile } from '@waha/structures/files.dto';
 import {
   CreateGroupRequest,
+  GroupParticipant,
   ParticipantsRequest,
   SettingsSecurityChangeInfo,
 } from '@waha/structures/groups.dto';
@@ -190,9 +187,11 @@ import {
   mergeMap,
   Observable,
   partition,
+  groupBy,
   share,
+  tap,
 } from 'rxjs';
-import { map } from 'rxjs/operators';
+import { debounceTime, map } from 'rxjs/operators';
 
 import { INowebStore } from './store/INowebStore';
 import { NowebPersistentStore } from './store/NowebPersistentStore';
@@ -203,6 +202,13 @@ import {
   IsEditedMessage,
   IsHistorySyncNotification,
 } from '@waha/core/utils/pwa';
+import { extractWALocation } from '@waha/core/engines/waproto/locaiton';
+import { extractVCards } from '@waha/core/engines/waproto/vcards';
+import { Activity } from '@waha/core/abc/activity';
+import {
+  WAHA_CLIENT_BROWSER_NAME,
+  WAHA_CLIENT_DEVICE_NAME,
+} from '@waha/core/env';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const promiseRetry = require('promise-retry');
 
@@ -312,8 +318,37 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   }
 
   getSocketConfig(agents: Agents | undefined, state): Partial<SocketConfig> {
+    // Detect browser
+    let browser = ['Ubuntu', 'Chrome', '22.04.4'] as WABrowserDescription;
+    let deviceName =
+      this.sessionConfig?.client?.deviceName ?? WAHA_CLIENT_DEVICE_NAME;
+    let browserName =
+      this.sessionConfig?.client?.browserName ?? WAHA_CLIENT_BROWSER_NAME;
+    if (browserName && !deviceName) {
+      browser = Browsers.appropriate(browserName);
+    } else if (!browserName && deviceName) {
+      browser = [deviceName, 'Chrome', '22.04.4'];
+    } else if (browserName && deviceName) {
+      switch (deviceName) {
+        case 'Mac OS':
+        case 'MacOS':
+        case 'macos':
+          browser = Browsers.macOS(browserName);
+          break;
+        case 'ubuntu':
+        case 'Ubuntu':
+          browser = Browsers.ubuntu(browserName);
+          break;
+        case 'windows':
+        case 'Windows':
+          browser = Browsers.windows(browserName);
+          break;
+        default:
+          browser = [deviceName, browserName, '22.04.4'];
+      }
+    }
+
     const fullSyncEnabled = this.sessionConfig?.noweb?.store?.fullSync || false;
-    const browser = ['Ubuntu', 'Chrome', '20.0.04'] as WABrowserDescription;
     let markOnlineOnConnect = this.sessionConfig?.noweb?.markOnline;
     if (markOnlineOnConnect == undefined) {
       markOnlineOnConnect = true;
@@ -632,10 +667,14 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   private issueMessageUpdateOnPoll() {
     // Fix for https://github.com/devlikeapro/waha/issues/960
     this.sock.ev.on('messages.upsert', async ({ messages }) => {
-      const meId = this.getSessionMeInfo().id;
-      if (!meId) {
+      const me = this.getSessionMeInfo();
+      if (!me) {
+        this.logger.warn(
+          'Cannot issue poll updates, session "me" info not found',
+        );
         return;
       }
+
       for (const message of messages) {
         const content = normalizeMessageContent(message.message);
         if (!content?.pollUpdateMessage) {
@@ -654,38 +693,75 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
           continue;
         }
 
-        const meIdNormalised = jidNormalizedUser(meId);
-        const pollCreatorJid = getKeyAuthor(creationMsgKey, meIdNormalised);
-        const voterJid = getKeyAuthor(message.key, meIdNormalised);
-        const pollEncKey = pollMsg.messageContextInfo?.messageSecret;
-
-        try {
-          const voteMsg = decryptPollVote(content.pollUpdateMessage.vote, {
-            pollEncKey,
-            pollCreatorJid,
-            pollMsgId: creationMsgKey.id,
-            voterJid,
-          });
-          this.sock.ev.emit('messages.update', [
-            {
-              key: creationMsgKey,
-              update: {
-                pollUpdates: [
-                  {
-                    pollUpdateMessageKey: message.key,
-                    vote: voteMsg,
-                    senderTimestampMs: (
-                      content.pollUpdateMessage.senderTimestampMs as Long
-                    ).toNumber(),
-                  },
-                ],
+        // Because of new @lid system it's hard to detect exactly how
+        // the vote has been encrypted, so we'll iterator over all possible
+        // not null combinations
+        const key = message.key;
+        const myIds = [jidNormalizedUser(me.id), jidNormalizedUser(me.lid)];
+        const participantIds = [
+          jidNormalizedUser(key?.participantAlt),
+          jidNormalizedUser(key?.remoteJidAlt),
+          jidNormalizedUser(key?.participant),
+          jidNormalizedUser(key?.remoteJid),
+        ];
+        let creators: string[] = creationMsgKey.fromMe
+          ? [...myIds, ...participantIds]
+          : [...participantIds, ...myIds];
+        let votes: string[] = key.fromMe
+          ? [...myIds, ...participantIds]
+          : [...participantIds, ...myIds];
+        creators = lodash.uniq(creators.filter(Boolean));
+        votes = lodash.uniq(votes.filter(Boolean));
+        let found = false;
+        for (const [pollCreatorJid, voterJid] of pairs(creators, votes)) {
+          try {
+            const pollEncKey = pollMsg.messageContextInfo?.messageSecret;
+            const voteMsg = decryptPollVote(content.pollUpdateMessage.vote, {
+              pollCreatorJid: pollCreatorJid,
+              pollMsgId: creationMsgKey.id,
+              pollEncKey: pollEncKey,
+              voterJid: voterJid,
+            });
+            this.sock.ev.emit('messages.update', [
+              {
+                key: creationMsgKey,
+                update: {
+                  pollUpdates: [
+                    {
+                      pollUpdateMessageKey: message.key,
+                      vote: voteMsg,
+                      senderTimestampMs: (
+                        content.pollUpdateMessage.senderTimestampMs as Long
+                      ).toNumber(),
+                    },
+                  ],
+                },
               },
-            },
-          ]);
-        } catch (err) {
+            ]);
+            found = true;
+            break;
+          } catch (err) {
+            this.logger.trace(
+              {
+                err: err.message,
+                key: key,
+                creationsMsgKey: creationMsgKey,
+                pollCreatorJid: pollCreatorJid,
+                voterJid: voterJid,
+              },
+              'failed to decrypt poll vote using creator and voter',
+            );
+          }
+        }
+        if (!found) {
           this.logger.warn(
-            { err, creationMsgKey },
-            'failed to decrypt poll vote',
+            {
+              key: key,
+              creationsMsgKey: creationMsgKey,
+              creators: creators,
+              voters: votes,
+            },
+            'failed to decrypt poll vote with any combination of creator/voter',
           );
         }
       }
@@ -725,6 +801,8 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   }
 
   private async end() {
+    this.cleanupPresenceTimeout();
+    this.presence = null;
     this.autoRestartJob.stop();
     // @ts-ignore
     this.sock?.ev?.removeAllListeners();
@@ -807,11 +885,13 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   /**
    * Profile methods
    */
+  @Activity()
   public async setProfileName(name: string): Promise<boolean> {
     await this.sock.updateProfileName(name);
     return true;
   }
 
+  @Activity()
   public async setProfileStatus(status: string): Promise<boolean> {
     await this.sock.updateProfileStatus(status);
     return true;
@@ -847,6 +927,12 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.generateMessageID();
   }
 
+  async rejectCall(from: string, id: string): Promise<void> {
+    const jid = toJID(this.ensureSuffix(from));
+    await this.sock.rejectCall(id, jid);
+  }
+
+  @Activity()
   async sendText(request: MessageTextRequest) {
     const chatId = toJID(this.ensureSuffix(request.chatId));
     const message = {
@@ -859,6 +945,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.sock.sendMessage(chatId, message, options);
   }
 
+  @Activity()
   public deleteMessage(chatId: string, messageId: string) {
     const jid = toJID(this.ensureSuffix(chatId));
     const key = parseMessageIdSerialized(messageId);
@@ -868,6 +955,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.sock.sendMessage(jid, { delete: key }, options);
   }
 
+  @Activity()
   public editMessage(
     chatId: string,
     messageId: string,
@@ -888,6 +976,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.sock.sendMessage(jid, message, options);
   }
 
+  @Activity()
   async sendContactVCard(request: MessageContactVcardRequest) {
     const chatId = toJID(this.ensureSuffix(request.chatId));
     const contacts = request.contacts.map((el) => ({ vcard: toVcardV3(el) }));
@@ -896,6 +985,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return await this.sock.sendMessage(chatId, msg, options);
   }
 
+  @Activity()
   async sendPoll(request: MessagePollRequest) {
     const requestPoll = request.poll;
     const poll = {
@@ -912,6 +1002,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.toWAMessage(result);
   }
 
+  @Activity()
   async reply(request: MessageReplyRequest) {
     const options = await this.getMessageOptions(request);
     const message = {
@@ -949,6 +1040,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return;
   }
 
+  @Activity()
   async sendButtons(request: SendButtonsRequest) {
     const chatId = toJID(this.ensureSuffix(request.chatId));
     const headerImage = await this.uploadMedia(request.headerImage, 'image');
@@ -967,6 +1059,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     throw new AvailableInPlusVersion();
   }
 
+  @Activity()
   async sendLocation(request: MessageLocationRequest) {
     const chatId = toJID(this.ensureSuffix(request.chatId));
     const msg = {
@@ -980,6 +1073,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return await this.sock.sendMessage(chatId, msg, options);
   }
 
+  @Activity()
   async forwardMessage(request: MessageForwardRequest): Promise<WAMessage> {
     const key = parseMessageIdSerialized(request.messageId);
     const forwardMessage = await this.store.loadMessage(key.remoteJid, key.id);
@@ -998,6 +1092,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.toWAMessage(result);
   }
 
+  @Activity()
   async sendLinkPreview(request: MessageLinkPreviewRequest) {
     const text = `${request.title}\n${request.url}`;
     const chatId = toJID(this.ensureSuffix(request.chatId));
@@ -1006,6 +1101,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.sock.sendMessage(chatId, msg, options);
   }
 
+  @Activity()
   async sendSeen(request: SendSeenRequest) {
     const keys = ExtractMessageKeysForRead(request);
     if (keys.length === 0) {
@@ -1023,11 +1119,13 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     this.sock?.ev.emit('messages.update', updates);
   }
 
-  async startTyping(request: ChatRequest) {
+  @Activity()
+  async startTyping(request: ChatRequest): Promise<void> {
     const chatId = toJID(this.ensureSuffix(request.chatId));
-    return this.sock.sendPresenceUpdate('composing', chatId);
+    await this.sock.sendPresenceUpdate('composing', chatId);
   }
 
+  @Activity()
   async stopTyping(request: ChatRequest) {
     const chatId = toJID(this.ensureSuffix(request.chatId));
     return this.sock.sendPresenceUpdate('paused', chatId);
@@ -1055,6 +1153,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return result;
   }
 
+  @Activity()
   public readChatMessages(
     chatId: string,
     request: ReadChatMessagesQuery,
@@ -1073,6 +1172,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return await this.processIncomingMessage(message, query.downloadMedia);
   }
 
+  @Activity()
   public async pinMessage(
     chatId: string,
     messageId: string,
@@ -1088,6 +1188,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return true;
   }
 
+  @Activity()
   public async unpinMessage(
     chatId: string,
     messageId: string,
@@ -1101,6 +1202,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return true;
   }
 
+  @Activity()
   async setReaction(request: MessageReactionRequest) {
     const key = parseMessageIdSerialized(request.messageId);
     if (isJidNewsletter(key.remoteJid)) {
@@ -1133,6 +1235,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     }
   }
 
+  @Activity()
   async setStar(request: MessageStarRequest) {
     const key = parseMessageIdSerialized(request.messageId);
     await this.sock.chatModify(
@@ -1206,6 +1309,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     };
   }
 
+  @Activity()
   protected async chatsPutArchive(
     chatId: string,
     archive: boolean,
@@ -1218,14 +1322,17 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     );
   }
 
+  @Activity()
   public chatsArchiveChat(chatId: string): Promise<any> {
     return this.chatsPutArchive(chatId, true);
   }
 
+  @Activity()
   public chatsUnarchiveChat(chatId: string): Promise<any> {
     return this.chatsPutArchive(chatId, false);
   }
 
+  @Activity()
   public async chatsUnreadChat(chatId: string): Promise<any> {
     const jid = toJID(chatId);
     const messages = await this.store.getMessagesByJid(jid, {}, { limit: 1 });
@@ -1244,6 +1351,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return labels.map(this.toLabel);
   }
 
+  @Activity()
   public async createLabel(label: LabelDTO): Promise<Label> {
     const labels = await this.store.getLabels();
     const highestLabelId = lodash.max(
@@ -1267,6 +1375,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     };
   }
 
+  @Activity()
   public async updateLabel(label: Label): Promise<Label> {
     const labelAction: LabelActionBody = {
       id: label.id,
@@ -1279,6 +1388,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return label;
   }
 
+  @Activity()
   public async deleteLabel(label: Label): Promise<void> {
     const labelAction: LabelActionBody = {
       id: label.id,
@@ -1303,6 +1413,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return labels.map(this.toLabel);
   }
 
+  @Activity()
   public async putLabelsToChat(chatId: string, labels: LabelID[]) {
     const jid = toJID(chatId);
     const labelsIds = labels.map((label) => label.id);
@@ -1344,6 +1455,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
    * Contacts methods
    */
 
+  @Activity()
   public async upsertContact(chatId: string, body: ContactUpdateBody) {
     const jid = toJID(chatId);
     let fullName = body.firstName;
@@ -1379,6 +1491,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return contacts.map(this.toWAContact);
   }
 
+  @Activity()
   public async fetchContactProfilePicture(id: string) {
     const contact = this.ensureSuffix(id);
     try {
@@ -1444,15 +1557,18 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   /**
    * Group methods
    */
+  @Activity()
   public createGroup(request: CreateGroupRequest) {
     const participants = request.participants.map(getId);
     return this.sock.groupCreate(request.name, participants);
   }
 
+  @Activity()
   public joinGroup(code: string) {
     return this.sock.groupAcceptInvite(code);
   }
 
+  @Activity()
   public joinInfoGroup(code: string) {
     return this.sock.groupGetInviteInfo(code);
   }
@@ -1467,6 +1583,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     delete group.participants;
   }
 
+  @Activity()
   public async refreshGroups(): Promise<boolean> {
     this.store.resetGroupsCache();
     await this.store.getGroups({});
@@ -1482,6 +1599,14 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return group;
   }
 
+  public async getGroupParticipants(id: string): Promise<GroupParticipant[]> {
+    const group = (await this.getGroup(id)) as GroupMetadata;
+    if (!group?.participants?.length) {
+      return [];
+    }
+    return group.participants.map(ToGroupParticipant);
+  }
+
   public async deleteGroup(id) {
     throw new NotImplementedByEngineError();
   }
@@ -1491,6 +1616,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return { adminsOnly: group.restrict };
   }
 
+  @Activity()
   public async setInfoAdminsOnly(id, value) {
     const setting = value ? 'locked' : 'unlocked';
     return await this.sock.groupSettingUpdate(id, setting);
@@ -1501,27 +1627,33 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return { adminsOnly: group.announce };
   }
 
+  @Activity()
   public async setMessagesAdminsOnly(id, value) {
     const setting = value ? 'announcement' : 'not_announcement';
     return await this.sock.groupSettingUpdate(id, setting);
   }
 
+  @Activity()
   public async leaveGroup(id) {
     return this.sock.groupLeave(id);
   }
 
+  @Activity()
   public async setDescription(id, description) {
     return this.sock.groupUpdateDescription(id, description);
   }
 
+  @Activity()
   public async setSubject(id, subject) {
     return this.sock.groupUpdateSubject(id, subject);
   }
 
+  @Activity()
   public async getInviteCode(id): Promise<string> {
     return this.sock.groupInviteCode(id);
   }
 
+  @Activity()
   public async revokeInviteCode(id): Promise<string> {
     await this.sock.groupRevokeInvite(id);
     return this.sock.groupInviteCode(id);
@@ -1532,27 +1664,37 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return groups[id].participants;
   }
 
+  @Activity()
   public async addParticipants(id, request: ParticipantsRequest) {
     const participants = request.participants.map(getId);
     return this.sock.groupParticipantsUpdate(id, participants, 'add');
   }
 
+  @Activity()
   public async removeParticipants(id, request: ParticipantsRequest) {
     const participants = request.participants.map(getId);
     return this.sock.groupParticipantsUpdate(id, participants, 'remove');
   }
 
+  @Activity()
   public async promoteParticipantsToAdmin(id, request: ParticipantsRequest) {
     const participants = request.participants.map(getId);
     return this.sock.groupParticipantsUpdate(id, participants, 'promote');
   }
 
+  @Activity()
   public async demoteParticipantsToUser(id, request: ParticipantsRequest) {
     const participants = request.participants.map(getId);
     return this.sock.groupParticipantsUpdate(id, participants, 'demote');
   }
 
   public async setPresence(presence: WAHAPresenceStatus, chatId?: string) {
+    switch (presence) {
+      case WAHAPresenceStatus.TYPING:
+      case WAHAPresenceStatus.RECORDING:
+      case WAHAPresenceStatus.PAUSED:
+        await this.maintainPresenceOnline();
+    }
     const enginePresence = ToEnginePresenceStatus[presence];
     if (!enginePresence) {
       throw new NotImplementedByEngineError(
@@ -1563,6 +1705,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       chatId = toJID(this.ensureSuffix(chatId));
     }
     await this.sock.sendPresenceUpdate(enginePresence, chatId);
+    this.presence = presence;
   }
 
   public async getPresences(): Promise<WAHAChatPresences[]> {
@@ -1585,6 +1728,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.toWahaPresences(jid, result);
   }
 
+  @Activity()
   public subscribePresence(id: string): Promise<void> {
     const jid = toJID(id);
     return this.sock.presenceSubscribe(jid);
@@ -1593,6 +1737,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   /**
    * Status methods
    */
+  @Activity()
   public async sendStatusMessage(
     message: any,
     options: any,
@@ -1658,6 +1803,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     }
   }
 
+  @Activity()
   public async sendTextStatus(status: TextStatus) {
     const message = {
       text: status.text,
@@ -1706,6 +1852,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return jids.filter((jid) => jid.endsWith('@s.whatsapp.net'));
   }
 
+  @Activity()
   public async deleteStatus(request: DeleteStatusRequest) {
     const messageId = request.id;
     const key = parseMessageIdSerialized(messageId, true);
@@ -1796,6 +1943,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return channels;
   }
 
+  @Activity()
   public async channelsCreateChannel(request: CreateChannelRequest) {
     const newsletter = await this.sock.newsletterCreate(
       request.name,
@@ -1809,27 +1957,33 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     return this.toChannel(toNewsletterMetadata(newsletter));
   }
 
+  @Activity()
   public async channelsGetChannelByInviteCode(inviteCode: string) {
     const newsletter = await this.sock.newsletterMetadata('invite', inviteCode);
     return this.toChannel(toNewsletterMetadata(newsletter));
   }
 
+  @Activity()
   public async channelsDeleteChannel(id: string) {
     return await this.sock.newsletterDelete(id);
   }
 
+  @Activity()
   public async channelsFollowChannel(id: string): Promise<any> {
     return await this.sock.newsletterFollow(id);
   }
 
+  @Activity()
   public async channelsUnfollowChannel(id: string): Promise<any> {
     return await this.sock.newsletterUnfollow(id);
   }
 
+  @Activity()
   public async channelsMuteChannel(id: string): Promise<any> {
     return await this.sock.newsletterMute(id);
   }
 
+  @Activity()
   public async channelsUnmuteChannel(id: string): Promise<any> {
     return await this.sock.newsletterUnmute(id);
   }
@@ -1953,10 +2107,13 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       filter(isMine), // ack comes only for MY messages
       map(this.convertMessageReceiptUpdateToMessageAck.bind(this)),
     );
-    const messageAck$ = merge(messageAckDirect$, messageAckGroups$).pipe(
-      DistinctAck(),
-    );
-    this.events2.get(WAHAEvents.MESSAGE_ACK).switch(messageAck$);
+    const messageAckDirectFinal$ = messageAckDirect$.pipe(DistinctAck());
+    const messageAckGroupsFinal$ = messageAckGroups$.pipe(DistinctAck());
+
+    this.events2.get(WAHAEvents.MESSAGE_ACK).switch(messageAckDirectFinal$);
+    this.events2
+      .get(WAHAEvents.MESSAGE_ACK_GROUP)
+      .switch(messageAckGroupsFinal$);
 
     //
     // Other
@@ -2051,6 +2208,8 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       ),
       share(),
     );
+
+    const acceptedCallIds = new Set<string>();
     this.events2.get(WAHAEvents.CALL_RECEIVED).switch(
       call$.pipe(
         filter((call: WACallEvent) => call.status === 'offer'),
@@ -2060,18 +2219,33 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     this.events2.get(WAHAEvents.CALL_ACCEPTED).switch(
       call$.pipe(
         filter((call: WACallEvent) => call.status === 'accept'),
+        tap((call: WACallEvent) => acceptedCallIds.add(call.id)),
         map(this.toCallData.bind(this)),
       ),
     );
     this.events2.get(WAHAEvents.CALL_REJECTED).switch(
-      calls$.pipe(
-        // Filter out if there's any "accept" events.
-        // Meaning it's been accepted on one device, but rejected on another
-        exclude((calls) => calls.some((call) => call.status === 'accept')),
-        mergeAll(),
-        filter((call: WACallEvent) => call.status === 'reject'),
+      call$.pipe(
+        filter(
+          (call: WACallEvent) =>
+            call.status === 'reject' || call.status === 'terminate',
+        ),
+        // Skip rejections when the call was accepted earlier (local or other device)
+        exclude((call: WACallEvent) => {
+          const shouldSkip = acceptedCallIds.has(call.id);
+          if (call.status === 'terminate') {
+            acceptedCallIds.delete(call.id);
+          }
+          return shouldSkip;
+        }),
         // We get two "reject" events, one with null isGroup property, ignore it
         exclude((call: WACallEvent) => call.isGroup == null),
+        groupBy((call: WACallEvent) => call.id || 'unknown'),
+        mergeMap((group$) =>
+          group$.pipe(
+            debounceTime(1_000),
+            tap((call: WACallEvent) => acceptedCallIds.delete(call.id)),
+          ),
+        ),
         map(this.toCallData.bind(this)),
       ),
     );
@@ -2270,6 +2444,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     const ack = message.ack || StatusToAck(message.status);
     const mediaContent = extractMediaContent(message.message);
     const source = this.getMessageSource(message.key.id);
+    const waproto = message.message;
     return {
       id: id,
       timestamp: ensureNumber(message.messageTimestamp),
@@ -2287,8 +2462,8 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       ack: ack,
       // @ts-ignore
       ackName: WAMessageAck[ack] || ACK_UNKNOWN,
-      location: message.location,
-      vCards: message.vCards,
+      location: extractWALocation(waproto),
+      vCards: extractVCards(waproto),
       replyTo: replyTo,
       _data: message,
     };
@@ -2467,6 +2642,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       timestamp: timestamp,
       isVideo: call.isVideo,
       isGroup: call.isGroup,
+      _data: call,
     };
   }
 
